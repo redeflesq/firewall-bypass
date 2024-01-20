@@ -175,6 +175,7 @@ BOOL VirtualExecuteEx(HANDLE hProcess, LPTHREAD_START_ROUTINE lpFunction, LPDWOR
 
 		if (lpRemoteParameters != NULL) {
 			if (!WriteProcessMemory(hProcess, lpRemoteParameters, lpParameters, dwParametersSize, NULL)) {
+				VirtualFreeEx(hProcess, lpRemoteParameters, 0, MEM_RELEASE);
 				VirtualFreeEx(hProcess, lpTargetImage, 0, MEM_RELEASE);
 				return FALSE;
 			}
