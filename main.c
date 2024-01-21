@@ -162,6 +162,8 @@ DWORD FindTargetProcessId(USHORT nRemotePort, BLACKLIST_PROC* lpBlacklistProc)
 		break;
 	}
 
+	MemFree(lpPidTable);
+
 	return dwTargetProcessId;
 }
 
@@ -517,6 +519,8 @@ int main()
 	}
 
 	DestroyCallbackParameters(&InParams);
+
+	CloseHandle(hTargetProcess);
 
 	return 0;
 }
