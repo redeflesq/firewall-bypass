@@ -9,6 +9,8 @@ Allows you to download data from the Internet without permission, using other pr
 | Name | Status | Comment
 | :-: | :-: | :-:
 | Windows Firewall | + | Fully
-| Comodo Firewall | ± | Blocked by [HIPS](https://en.wikipedia.org/wiki/Intrusion_detection_system/)
-| [Simplewall](https://github.com/henrypp/simplewall/) | + | Fully
-| [TinyWall](https://github.com/pylorak/TinyWall/) | + | Fully
+| Comodo Firewall | ± | Blocked by [HIPS](https://en.wikipedia.org/wiki/Intrusion_detection_system)
+| [Simplewall](https://github.com/henrypp/simplewall) | + | Fully
+| [TinyWall](https://github.com/pylorak/TinyWall) | + | Fully
+| ZoneAlarm | + | Fully
+| GlassWire | + | Fully (Logged)
